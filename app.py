@@ -53,7 +53,7 @@ page = st.sidebar.radio(
 # LOAD DATA
 # ============================================================
 
-FILE_PATH = "C:\\Users\\Acer\\Desktop\\AIML\\historical_data.csv"
+FILE_PATH = "historical_data.csv"
 
 @st.cache_data
 def load_raw_data():
