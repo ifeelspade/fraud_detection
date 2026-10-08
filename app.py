@@ -31,7 +31,7 @@ st.caption(
 )
 st.caption(
     
-    "Utkarsh Kulshrestha/nVinay Supekar/nSiddhant Chiring/nShashwat Aayush"
+    "Utkarsh Kulshrestha\nVinay Supekar\nSiddhant Chiring\nShashwat Aayush"
 )
 
 # ============================================================
