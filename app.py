@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 
 import streamlit as st
 import pandas as pd
@@ -44,8 +45,9 @@ page = st.sidebar.radio(
         "5. Model Selection",
         "6. Train the Model",
         "7. Model Results",
-        "8. Live Fraud Prediction",
-        "9. Cleaned Data"
+        "8. How We Cure Bias",
+        "9. Live Fraud Prediction",
+        "10. Cleaned Data"
     ]
 )
 
@@ -213,23 +215,67 @@ def clean_data(df_raw):
 # FEATURE ENGINEERING + MODEL
 # ============================================================
 
-@st.cache_data
-def prepare_features(df):
+NIGHT_HOURS = [22, 23, 1, 2, 3, 4, 5]
 
-    data = df.copy()
+# Variables that can act as proxies for customer demographics
+# (income level, age group, urban / digital profile).
+# They are REMOVED from the final model (see page 8).
+PROXY_FEATURES = [
+    "FpVehicleAgeMonths",
+    "PolicyWasSubscribedOnInternet"
+]
+
+NUM_COLS = [
+    "PolicyTenureDays",
+    "ClaimAmount_log",
+    "NightLoss",
+    "FpVehicleAgeMonths",
+    "EasinessToStage",
+    "NumberOfBodilyInjuries",
+    "ClaimWihoutIdentifiedThirdParty",
+    "PolicyWasSubscribedOnInternet"
+]
+
+CAT_COLS = [
+    "ClaimCause",
+    "ConnectionBetweenParties",
+    "FirstPartyVehicleType"
+]
+
+# Customer segments used for the fairness audit
+AUDIT_COLS = [
+    "Channel",
+    "Vehicle Age Band",
+    "Claim Amount Band",
+    "Vehicle Type",
+    "Connection",
+    "Loss Time"
+]
+
+MIN_GROUP = 30   # ignore very small segments in the fairness scorecard
+
+
+def build_features(data, claim_cap):
+    """
+    ONE function used for both training and live prediction,
+    so the simulator can never differ from the trained pipeline.
+    """
+
+    data = data.copy()
 
     data["PolicyTenureDays"] = (
         data["LossDate"]
         - data["FirstPolicySubscriptionDate"]
     ).dt.days
 
+    # Bias cure: cap extreme claim amounts at the 99th percentile
     data["ClaimAmount_log"] = np.log1p(
-        data["ClaimAmount"]
+        data["ClaimAmount"].clip(upper=claim_cap)
     )
 
     data["NightLoss"] = (
         data["LossHour"]
-        .isin([22, 23, 1, 2, 3, 4, 5])
+        .isin(NIGHT_HOURS)
         .astype(int)
     )
 
@@ -239,47 +285,101 @@ def prepare_features(df):
         .add_prefix("Cover_")
     )
 
-    cat_cols = [
-        "ClaimCause",
-        "ConnectionBetweenParties",
-        "FirstPartyVehicleType"
-    ]
-
     cat_flags = pd.get_dummies(
-        data[cat_cols],
+        data[CAT_COLS],
         dtype=int
     )
 
-    num_cols = [
-        "PolicyTenureDays",
-        "ClaimAmount_log",
-        "NightLoss",
-        "FpVehicleAgeMonths",
-        "EasinessToStage",
-        "NumberOfBodilyInjuries",
-        "ClaimWihoutIdentifiedThirdParty",
-        "PolicyWasSubscribedOnInternet"
-    ]
-
-    X = pd.concat(
+    return pd.concat(
         [
-            data[num_cols],
+            data[NUM_COLS],
             cat_flags,
             cover_flags
         ],
         axis=1
     )
 
-    y = data["Fraud"]
+
+@st.cache_data
+def prepare_features(df, claim_cap):
+
+    X = build_features(df, claim_cap)
+    y = df["Fraud"]
 
     return X, y
 
 
+def make_segments(df):
+    """Customer segments used ONLY for bias auditing / reweighing."""
+
+    seg = pd.DataFrame(index=df.index)
+
+    seg["Channel"] = np.where(
+        df["PolicyWasSubscribedOnInternet"] == 1,
+        "Online",
+        "Offline"
+    )
+
+    age = df["FpVehicleAgeMonths"]
+
+    seg["Vehicle Age Band"] = np.where(
+        age.isna(),
+        "Unknown",
+        np.where(age <= age.median(), "Newer", "Older")
+    )
+
+    seg["Claim Amount Band"] = pd.qcut(
+        df["ClaimAmount"],
+        4,
+        duplicates="drop"
+    ).astype(str)
+
+    seg["Vehicle Type"] = df["FirstPartyVehicleType"]
+    seg["Connection"] = df["ConnectionBetweenParties"]
+
+    seg["Loss Time"] = np.where(
+        df["LossHour"].isna(),
+        "Unknown",
+        np.where(df["LossHour"].isin(NIGHT_HOURS), "Night", "Day")
+    )
+
+    return seg
+
+
+def reweighing_weights(groups, y):
+    """
+    Reweighing (Kamiran & Calders): weight each training row so that
+    the fraud label becomes statistically independent of the customer
+    segment. Weights are clipped to avoid instability in tiny segments.
+    """
+
+    d = pd.DataFrame({
+        "g": np.asarray(groups),
+        "y": np.asarray(y)
+    })
+
+    n = len(d)
+
+    p_g = d["g"].value_counts(normalize=True)
+    p_y = d["y"].value_counts(normalize=True)
+    p_gy = d.groupby(["g", "y"])["y"].transform("size") / n
+
+    w = (
+        d["g"].map(p_g).values
+        * d["y"].map(p_y).values
+        / p_gy.values
+    )
+
+    return np.clip(w, 0.25, 5.0)
+
+
 @st.cache_resource
-def train_model(X, y):
+def train_model(X, y, drop_cols=(), groups=None):
+
+    X_used = X.drop(columns=list(drop_cols))
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X,
+        X_used,
         y,
         test_size=0.30,
         stratify=y,
@@ -325,7 +425,15 @@ def train_model(X, y):
         scoring="average_precision"
     )
 
-    grid.fit(X_train, y_train)
+    fit_params = {}
+
+    if groups is not None:
+        fit_params["logreg__sample_weight"] = reweighing_weights(
+            groups.loc[X_train.index],
+            y_train
+        )
+
+    grid.fit(X_train, y_train, **fit_params)
 
     best_model = grid.best_estimator_
 
@@ -388,11 +496,12 @@ def train_model(X, y):
         best_model
         .named_steps["logreg"]
         .coef_[0],
-        index=X.columns
+        index=X_used.columns
     )
 
     return {
         "model": best_model,
+        "feature_cols": list(X_used.columns),
         "X_train": X_train,
         "X_test": X_test,
         "y_train": y_train,
@@ -416,14 +525,115 @@ def train_model(X, y):
 
 
 # ============================================================
+# FAIRNESS AUDIT HELPERS
+# ============================================================
+
+def build_audit_frame(df, res):
+
+    audit = make_segments(df).loc[res["X_test"].index].copy()
+    audit["flagged"] = np.asarray(res["flagged"], dtype=bool)
+    audit["Fraud"] = res["y_test"].values
+
+    return audit
+
+
+def audit_group(audit, col):
+
+    overall_flag_rate = audit["flagged"].mean()
+
+    rows = {}
+
+    for name, d in audit.groupby(col):
+
+        fraud = d["Fraud"] == 1
+
+        rows[name] = {
+            "Claims": len(d),
+            "Actual Fraud Rate": d["Fraud"].mean(),
+            "Flag Rate": d["flagged"].mean(),
+            "Precision": (
+                d.loc[d["flagged"], "Fraud"].mean()
+                if d["flagged"].any() else np.nan
+            ),
+            "Recall": (
+                d.loc[fraud, "flagged"].mean()
+                if fraud.any() else np.nan
+            ),
+            "False Positive Rate": (
+                d.loc[~fraud, "flagged"].mean()
+                if (~fraud).any() else np.nan
+            ),
+            "Flag Rate vs Overall": (
+                d["flagged"].mean() / overall_flag_rate
+                if overall_flag_rate > 0 else np.nan
+            )
+        }
+
+    return pd.DataFrame.from_dict(rows, orient="index")
+
+
+def fairness_summary(audit):
+
+    rows = []
+
+    for col in AUDIT_COLS:
+
+        stats = audit_group(audit, col)
+        stats = stats[stats["Claims"] >= MIN_GROUP]
+
+        if len(stats) < 2:
+            continue
+
+        flag_rate = stats["Flag Rate"]
+
+        ratio = (
+            flag_rate.min() / flag_rate.max()
+            if flag_rate.max() > 0 else np.nan
+        )
+
+        fpr_gap = (
+            stats["False Positive Rate"].max()
+            - stats["False Positive Rate"].min()
+        ) * 100
+
+        rows.append({
+            "Segment View": col,
+            "Flag-Rate Ratio (min/max)": ratio,
+            "FPR Gap (pp)": fpr_gap
+        })
+
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "Segment View",
+            "Flag-Rate Ratio (min/max)",
+            "FPR Gap (pp)"
+        ]
+    )
+
+
+# ============================================================
 # RUN PIPELINE
 # ============================================================
 
 try:
     df_raw = load_raw_data()
     df_clean, cleaning_info = clean_data(df_raw)
-    X, y = prepare_features(df_clean)
-    results = train_model(X, y)
+
+    # 99th percentile cap for claim amount (bias cure + stable simulation)
+    CLAIM_CAP = float(df_clean["ClaimAmount"].quantile(0.99))
+
+    X, y = prepare_features(df_clean, CLAIM_CAP)
+
+    # Segments used for reweighing and fairness audit
+    segments = make_segments(df_clean)
+    fairness_groups = segments["Channel"] + " | " + segments["Vehicle Age Band"]
+
+    # BEFORE: baseline model (all features, no reweighing)
+    results_base = train_model(X, y, (), None)
+
+    # AFTER: final bias-mitigated model (proxies removed + reweighing)
+    results = train_model(X, y, tuple(PROXY_FEATURES), fairness_groups)
 
 except FileNotFoundError:
     st.error(
@@ -449,7 +659,7 @@ if page == "1. Executive Summary":
     - identify potentially fraudulent claims
     - reduce manual investigation effort
     - handle severe class imbalance
-    - limit unnecessary bias from unrelated variables
+    - measure and reduce bias (proxy removal, reweighing, fairness audit)
     - provide an interpretable risk score
     """)
 
@@ -490,6 +700,8 @@ if page == "1. Executive Summary":
     ↓  
     **Train/Test Split with stratification**
     ↓  
+    **Bias mitigation: proxy removal + reweighing + claim cap**
+    ↓  
     **Median Imputation + StandardScaler**
     ↓  
     **L1 Logistic Regression**
@@ -499,6 +711,8 @@ if page == "1. Executive Summary":
     **Risk scoring**
     ↓  
     **Flag top 5% highest-risk claims**
+    ↓  
+    **Fairness audit across customer segments**
     """)
 
     st.info(
@@ -712,7 +926,7 @@ elif page == "4. Feature Engineering":
 
     c2.metric(
         "Final Model Features",
-        X.shape[1]
+        len(results["feature_cols"])
     )
 
     c3.metric(
@@ -884,6 +1098,8 @@ elif page == "7. Model Results":
 
     st.header("7️⃣ Model Results")
 
+    st.caption("Final model = bias-mitigated version (proxies removed, reweighed, claim amount capped).")
+
     c1, c2, c3, c4 = st.columns(4)
 
     c1.metric(
@@ -996,19 +1212,251 @@ elif page == "7. Model Results":
 
 
 # ============================================================
-# PAGE 8 — LIVE FRAUD PREDICTION
+# PAGE 8 — HOW WE CURE BIAS
 # ============================================================
 
-elif page == "8. Live Fraud Prediction":
+elif page == "8. How We Cure Bias":
 
-    st.header("8️⃣ Live Fraud Prediction")
+    st.header("8️⃣ How We Cure Bias")
+
+    st.markdown(
+        """
+        A fraud model can be **accurate and still unfair**. For an insurer, an unfair
+        model means honest customers from certain segments are investigated more
+        often — leading to churn, complaints and regulatory risk.
+
+        Our dataset has **no direct protected attributes** (no gender, age, religion
+        or caste), but some variables can act as **proxies** for them. We therefore
+        (1) removed risk at the source, (2) corrected the training process, and
+        (3) **measured** the result with a fairness audit.
+        """
+    )
+
+    st.subheader("Where bias can enter")
+
+    st.markdown(
+        """
+        - **Proxy bias** — vehicle age can stand in for income, online policy for age / urban profile, night loss for shift workers.
+        - **Label bias** — `Fraud = 1` comes from past investigations, so the model can copy past investigators' habits.
+        - **Sampling bias** — some segments have very few fraud cases, so their scores are unreliable.
+        - **Extrapolation** — extreme claim amounts push scores to arbitrary extremes.
+        """
+    )
+
+    st.subheader("Cures applied in this project")
+
+    cure_table = pd.DataFrame({
+        "#": [1, 2, 3, 4, 5, 6],
+        "Bias Risk": [
+            "Direct use of protected attributes",
+            "Proxy variables (income / age / digital profile)",
+            "Fraud rate differs by segment in the training data",
+            "Extreme claim amounts get arbitrary scores",
+            "Automatic decisions wrongly accuse honest customers",
+            "Unfairness stays invisible if nobody measures it"
+        ],
+        "Cure Applied": [
+            "Only 13 claim-related columns are selected; gender, age, religion, caste etc. are never used",
+            "Vehicle Age and Online-Policy flag are REMOVED from the model features",
+            "Reweighing (Kamiran & Calders): training rows are weighted so fraud is independent of Channel × Vehicle-Age segment",
+            "Claim amount is capped at the 99th percentile in training AND in the live simulator",
+            "Score is used only to prioritise the top-5% queue for human investigators; percentile is shown, not a verdict",
+            "Fairness audit across 6 segment views, Before vs After (below)"
+        ]
+    })
+
+    st.dataframe(
+        cure_table,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    audit_base = build_audit_frame(df_clean, results_base)
+    audit_final = build_audit_frame(df_clean, results)
+
+    # --------------------------------------------------------
+    st.subheader("Step 1 — What did fairness cost us in accuracy?")
+
+    def _pp(a, b):
+        return f"{(a - b) * 100:+.2f} pp"
+
+    perf = pd.DataFrame({
+        "Metric": [
+            "ROC-AUC",
+            "Hit Rate (precision in top 5%)",
+            "Fraud Capture Rate (recall in top 5%)"
+        ],
+        "Before (baseline)": [
+            f"{results_base['roc_auc']:.3f}",
+            f"{results_base['hit_rate']:.2%}",
+            f"{results_base['fraud_capture_rate']:.2%}"
+        ],
+        "After (final model)": [
+            f"{results['roc_auc']:.3f}",
+            f"{results['hit_rate']:.2%}",
+            f"{results['fraud_capture_rate']:.2%}"
+        ],
+        "Change": [
+            f"{results['roc_auc'] - results_base['roc_auc']:+.3f}",
+            _pp(results["hit_rate"], results_base["hit_rate"]),
+            _pp(results["fraud_capture_rate"], results_base["fraud_capture_rate"])
+        ]
+    })
+
+    st.dataframe(
+        perf,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.caption(
+        "Fairness usually costs a little accuracy. This table shows exactly how much."
+    )
+
+    # --------------------------------------------------------
+    st.subheader("Step 2 — Fairness scorecard (Before vs After)")
+
+    sum_base = fairness_summary(audit_base)
+    sum_final = fairness_summary(audit_final)
+
+    scorecard = sum_base.merge(
+        sum_final,
+        on="Segment View",
+        suffixes=(" — Before", " — After")
+    )
+
+    if scorecard.empty:
+        st.info("Not enough claims per segment to build the scorecard.")
+    else:
+        improved = int(
+            (
+                scorecard["Flag-Rate Ratio (min/max) — After"]
+                > scorecard["Flag-Rate Ratio (min/max) — Before"]
+            ).sum()
+        )
+
+        gap_improved = int(
+            (
+                scorecard["FPR Gap (pp) — After"]
+                < scorecard["FPR Gap (pp) — Before"]
+            ).sum()
+        )
+
+        c1, c2 = st.columns(2)
+
+        c1.metric(
+            "Flag-rate parity improved in",
+            f"{improved} of {len(scorecard)} segment views"
+        )
+
+        c2.metric(
+            "False-positive gap reduced in",
+            f"{gap_improved} of {len(scorecard)} segment views"
+        )
+
+        st.dataframe(
+            scorecard.round(3),
+            use_container_width=True,
+            hide_index=True
+        )
+
+    st.markdown(
+        """
+        **How to read it**
+
+        - **Flag-Rate Ratio (min/max)**: 1.0 means every segment is flagged at the same rate.
+          Below about 0.8 deserves a review (four-fifths rule).
+        - **FPR Gap (pp)**: difference in the share of *honest* customers wrongly flagged
+          between the best and worst treated segment. Lower is fairer.
+        - If a segment truly has more fraud, a higher flag rate can be justified —
+          but a higher **false-positive rate** is not.
+        """
+    )
+
+    # --------------------------------------------------------
+    st.subheader("Step 3 — Segment-level audit")
+
+    audit_col = st.selectbox(
+        "Choose a segment view",
+        AUDIT_COLS
+    )
+
+    fmt = {
+        "Claims": "{:,.0f}",
+        "Actual Fraud Rate": "{:.2%}",
+        "Flag Rate": "{:.2%}",
+        "Precision": "{:.2%}",
+        "Recall": "{:.2%}",
+        "False Positive Rate": "{:.2%}",
+        "Flag Rate vs Overall": "{:.2f}"
+    }
+
+    tab_after, tab_before = st.tabs(
+        ["After (final model)", "Before (baseline)"]
+    )
+
+    with tab_after:
+        st.dataframe(
+            audit_group(audit_final, audit_col).style.format(fmt, na_rep="–"),
+            use_container_width=True
+        )
+
+    with tab_before:
+        st.dataframe(
+            audit_group(audit_base, audit_col).style.format(fmt, na_rep="–"),
+            use_container_width=True
+        )
+
+    st.caption(
+        f"Segments with fewer than {MIN_GROUP} claims are shown here "
+        "but ignored in the scorecard because their rates are too noisy."
+    )
+
+    # --------------------------------------------------------
+    st.subheader("Limitations")
+
+    st.warning(
+        "1) The Fraud label comes from past investigations, so historical bias can remain.  \n"
+        "2) We audit proxy segments, not gender/age/religion directly — the dataset does not contain them.  \n"
+        "3) Fairness and accuracy trade off; the business must decide the acceptable balance.  \n"
+        "4) The audit must be repeated whenever the model is retrained."
+    )
+
+
+# ============================================================
+# PAGE 9 — LIVE FRAUD PREDICTION
+# ============================================================
+
+elif page == "9. Live Fraud Prediction":
+
+    st.header("9️⃣ Live Fraud Prediction")
 
     st.write(
-        "Enter claim information below. The trained model will calculate "
-        "a fraud probability and classify the claim as high or low risk."
+        "Enter claim information below. The final (bias-mitigated) model calculates "
+        "a risk score and shows where the claim ranks among all unseen test claims."
+    )
+
+    st.caption(
+        "Vehicle Age and Online Policy are shown but disabled — they were removed "
+        "from the model as bias proxies (see page 8)."
     )
 
     st.divider()
+
+    today = date.today()
+
+    default_amount = float(round(df_clean["ClaimAmount"].median(), -2))
+    default_age = float(round(df_clean["FpVehicleAgeMonths"].median()))
+
+    easiness_options = sorted(
+        df_clean["EasinessToStage"].dropna().unique().tolist()
+    )
+
+    cover_options = [
+        c.replace("Cover_", "")
+        for c in results["feature_cols"]
+        if c.startswith("Cover_") and c != "Cover_NoCoverInfo"
+    ]
 
     col1, col2, col3 = st.columns(3)
 
@@ -1016,15 +1464,17 @@ elif page == "8. Live Fraud Prediction":
         claim_amount = st.number_input(
             "Claim Amount",
             min_value=0.0,
-            value=1500.0,
+            value=default_amount,
             step=100.0
         )
 
         vehicle_age = st.number_input(
             "Vehicle Age (months)",
             min_value=0.0,
-            value=100.0,
-            step=1.0
+            value=default_age,
+            step=1.0,
+            disabled=True,
+            help="Not used by the model — removed as a bias proxy."
         )
 
         bodily_injuries = st.number_input(
@@ -1038,7 +1488,7 @@ elif page == "8. Live Fraud Prediction":
 
         easiness = st.selectbox(
             "Easiness To Stage",
-            [0.25, 0.50]
+            easiness_options
         )
 
         loss_hour = st.slider(
@@ -1052,7 +1502,9 @@ elif page == "8. Live Fraud Prediction":
             "Policy Subscribed Online?",
             [0, 1],
             format_func=lambda x:
-                "Yes" if x == 1 else "No"
+                "Yes" if x == 1 else "No",
+            disabled=True,
+            help="Not used by the model — removed as a bias proxy."
         )
 
     with col3:
@@ -1091,28 +1543,50 @@ elif page == "8. Live Fraud Prediction":
 
     covers = st.multiselect(
         "Claim Involved Covers",
-        [
-            "MaterialDamages",
-            "ActLiability",
-            "ReplacementVehicle",
-            "MedicalCare",
-            "Fire",
-            "Theft"
-        ],
-        default=["MaterialDamages"]
+        cover_options,
+        default=[
+            c for c in ["MaterialDamages"]
+            if c in cover_options
+        ]
     )
 
     policy_start = st.date_input(
-        "First Policy Subscription Date"
+        "First Policy Subscription Date",
+        value=today - timedelta(days=730),
+        min_value=date(2000, 1, 1),
+        max_value=today
     )
 
     loss_date = st.date_input(
-        "Loss Date"
+        "Loss Date",
+        value=today,
+        min_value=date(2000, 1, 1),
+        max_value=today
     )
+
+    # ---------------- input checks ----------------
+    dates_ok = loss_date >= policy_start
+    tenure_days = (loss_date - policy_start).days
+
+    if not dates_ok:
+        st.error("Loss Date cannot be earlier than the First Policy Subscription Date.")
+    elif tenure_days < 30:
+        st.info(
+            f"Policy tenure is only {tenure_days} day(s). "
+            "A claim this soon after inception is unusual."
+        )
+
+    if claim_amount > CLAIM_CAP:
+        st.warning(
+            f"Claim amount is above the 99th percentile of historical claims "
+            f"({CLAIM_CAP:,.0f}). The model caps it at this value, so the score "
+            "cannot go beyond what it learned from real data."
+        )
 
     if st.button(
         "🔎 Predict Fraud Risk",
-        type="primary"
+        type="primary",
+        disabled=not dates_ok
     ):
 
         live = pd.DataFrame({
@@ -1137,93 +1611,81 @@ elif page == "8. Live Fraud Prediction":
             "NumberOfBodilyInjuries": [bodily_injuries],
             "PolicyWasSubscribedOnInternet": [
                 internet_policy
-            ],
-            "LossHour_Unknown": [0]
+            ]
         })
 
-        live["PolicyTenureDays"] = (
-            live["LossDate"]
-            - live["FirstPolicySubscriptionDate"]
-        ).dt.days
-
-        live["ClaimAmount_log"] = np.log1p(
-            live["ClaimAmount"]
-        )
-
-        live["NightLoss"] = (
-            live["LossHour"]
-            .isin([22, 23, 1, 2, 3, 4, 5])
-            .astype(int)
-        )
-
-        cover_flags_live = (
-            live["ClaimInvolvedCovers"]
-            .str.get_dummies(sep=" ")
-            .add_prefix("Cover_")
-        )
-
-        cat_flags_live = pd.get_dummies(
-            live[
-                [
-                    "ClaimCause",
-                    "ConnectionBetweenParties",
-                    "FirstPartyVehicleType"
-                ]
-            ],
-            dtype=int
-        )
-
-        num_cols_live = [
-            "PolicyTenureDays",
-            "ClaimAmount_log",
-            "NightLoss",
-            "FpVehicleAgeMonths",
-            "EasinessToStage",
-            "NumberOfBodilyInjuries",
-            "ClaimWihoutIdentifiedThirdParty",
-            "PolicyWasSubscribedOnInternet"
-        ]
-
-        live_X = pd.concat(
-            [
-                live[num_cols_live],
-                cat_flags_live,
-                cover_flags_live
-            ],
-            axis=1
-        )
-
-        # Align exactly with training columns
-        live_X = live_X.reindex(
-            columns=X.columns,
+        # Same feature function as training (no train/serve mismatch)
+        live_X = build_features(live, CLAIM_CAP).reindex(
+            columns=results["feature_cols"],
             fill_value=0
         )
 
-        probability = (
-            results["model"]
-            .predict_proba(live_X)[0, 1]
-        )
+        model = results["model"]
+
+        score = float(model.predict_proba(live_X)[0, 1])
+
+        percentile = float((results["scores"] < score).mean())
 
         st.divider()
 
         st.subheader("Live Model Output")
 
-        if probability >= results["cutoff"]:
+        if score >= results["cutoff"]:
             st.error(
-                f"🚨 HIGH RISK — Fraud Probability: {probability:.2%}"
+                "🚨 HIGH RISK — inside the top-5% investigation queue"
+            )
+        elif percentile >= 0.80:
+            st.warning(
+                "⚠️ ELEVATED RISK — above 80% of test claims, "
+                "but below the top-5% queue threshold"
             )
         else:
             st.success(
-                f"✅ LOWER RISK — Fraud Probability: {probability:.2%}"
+                "✅ LOWER RISK — below 80% of test claims"
             )
 
-        st.progress(
-            min(float(probability), 1.0)
+        m1, m2, m3 = st.columns(3)
+
+        m1.metric("Risk Score", f"{score:.2%}")
+        m2.metric("Percentile vs test claims", f"{percentile:.1%}")
+        m3.metric("Top-5% queue threshold", f"{results['cutoff']:.2%}")
+
+        st.progress(min(max(score, 0.0), 1.0))
+
+        st.caption(
+            "The score is a ranking signal, not a calibrated probability of fraud "
+            "(class balancing and reweighing inflate it). Use the percentile and "
+            "the queue threshold to interpret it."
         )
 
-        st.write(
-            f"Model risk threshold used for the top-5% investigation queue: "
-            f"**{results['cutoff']:.4f}**"
+        # ---- why this score? ----
+        scaled = model[:-1].transform(live_X)
+
+        contrib = pd.Series(
+            scaled[0] * model.named_steps["logreg"].coef_[0],
+            index=results["feature_cols"]
+        )
+
+        contrib = contrib[contrib != 0]
+
+        top = contrib.loc[
+            contrib.abs().sort_values(ascending=False).index
+        ].head(6)
+
+        st.subheader("Top drivers of this score")
+
+        st.dataframe(
+            pd.DataFrame({
+                "Feature": top.index,
+                "Contribution (log-odds)": top.values.round(3),
+                "Direction": np.where(
+                    top.values > 0,
+                    "Pushes toward fraud",
+                    "Pushes away from fraud"
+                )
+            }),
+            use_container_width=True,
+            hide_index=True
         )
 
         st.info(
@@ -1231,14 +1693,47 @@ elif page == "8. Live Fraud Prediction":
             "The purpose is to prioritize claims for human investigation."
         )
 
+    with st.expander("Simulator sanity check (real unseen test claims)"):
+
+        check = pd.Series(
+            results["scores"],
+            index=results["y_test"].index
+        )
+
+        is_fraud = results["y_test"] == 1
+
+        check_df = pd.DataFrame({
+            "Group": ["Actual fraud", "Actual non-fraud"],
+            "Claims": [int(is_fraud.sum()), int((~is_fraud).sum())],
+            "Average Risk Score": [
+                f"{check[is_fraud].mean():.2%}",
+                f"{check[~is_fraud].mean():.2%}"
+            ],
+            "Share inside top-5% queue": [
+                f"{(check[is_fraud] >= results['cutoff']).mean():.2%}",
+                f"{(check[~is_fraud] >= results['cutoff']).mean():.2%}"
+            ]
+        })
+
+        st.dataframe(
+            check_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.caption(
+            "Actual fraud claims should score clearly higher than non-fraud claims. "
+            "If not, the model is weak, not the simulator."
+        )
+
 
 # ============================================================
 # PAGE 9 — CLEANED DATA
 # ============================================================
 
-elif page == "9. Cleaned Data":
+elif page == "10. Cleaned Data":
 
-    st.header("9️⃣ Final Cleaned Dataset")
+    st.header("🔟 Final Cleaned Dataset")
 
     st.write(
         "This is the dataset after the documented cleaning process."
@@ -1285,5 +1780,6 @@ st.sidebar.caption(
     "Fraud Detection Project\n"
     "Logistic Regression + L1 Regularization\n"
     "5-Fold Cross Validation\n"
-    "Top 5% Risk-Based Investigation"
+    "Top 5% Risk-Based Investigation\n"
+    "Bias Mitigation: Proxy Removal + Reweighing + Fairness Audit"
 )
