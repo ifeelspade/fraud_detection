@@ -1246,14 +1246,15 @@ elif page == "8. How We Cure Bias":
     st.subheader("Cures applied in this project")
 
     cure_table = pd.DataFrame({
-        "#": [1, 2, 3, 4, 5, 6],
+        "#": [1, 2, 3, 4, 5, 6, 7],
         "Bias Risk": [
             "Direct use of protected attributes",
             "Proxy variables (income / age / digital profile)",
             "Fraud rate differs by segment in the training data",
             "Extreme claim amounts get arbitrary scores",
             "Automatic decisions wrongly accuse honest customers",
-            "Unfairness stays invisible if nobody measures it"
+            "Unfairness stays invisible if nobody measures it",
+            "The model is wrong for an individual (e.g. a high-premium, loyal customer treated as a suspect)"
         ],
         "Cure Applied": [
             "Only 13 claim-related columns are selected; gender, age, religion, caste etc. are never used",
@@ -1261,7 +1262,8 @@ elif page == "8. How We Cure Bias":
             "Reweighing (Kamiran & Calders): training rows are weighted so fraud is independent of Channel × Vehicle-Age segment",
             "Claim amount is capped at the 99th percentile in training AND in the live simulator",
             "Score is used only to prioritise the top-5% queue for human investigators; percentile is shown, not a verdict",
-            "Fairness audit across 6 segment views, Before vs After (below)"
+            "Fairness audit across 6 segment views, Before vs After (below)",
+            "Case-by-case human-in-the-loop review: tiered routing by risk AND customer value, review committee for sensitive cases, AI never denies alone (Step 4)"
         ]
     })
 
@@ -1413,13 +1415,320 @@ elif page == "8. How We Cure Bias":
     )
 
     # --------------------------------------------------------
+    st.subheader("Step 4 — Managerial perspective: AI recommends, humans decide")
+
+    st.markdown(
+        """
+        Fairness is not only a statistics problem — it is a **business-judgement problem**.
+        Two mistakes are costly, and they pull in opposite directions:
+
+        - **Paying a fraudulent claim** → direct financial loss.
+        - **Wrongly suspecting an honest, high-value customer** → delay, embarrassment,
+          complaint, churn and loss of future premium.
+
+        One threshold cannot balance both. So the model **prioritises**, and a
+        **case-by-case human review** takes the decision.
+        """
+    )
+
+    # ---- empirical fraud rate by risk tier (unseen test claims) ----
+    tier_scores = pd.Series(
+        results["scores"],
+        index=results["y_test"].index
+    )
+
+    tier_pct = tier_scores.rank(pct=True)
+
+    tier = pd.Series(
+        np.where(
+            tier_scores >= results["cutoff"],
+            "1. High (top-5% queue)",
+            np.where(
+                tier_pct >= 0.80,
+                "2. Elevated (80th-95th pct)",
+                "3. Lower (below 80th pct)"
+            )
+        ),
+        index=tier_scores.index
+    )
+
+    tier_tbl = (
+        pd.DataFrame({
+            "Tier": tier,
+            "Fraud": results["y_test"]
+        })
+        .groupby("Tier")
+        .agg(
+            Claims=("Fraud", "size"),
+            Frauds=("Fraud", "sum"),
+            FraudRate=("Fraud", "mean")
+        )
+    )
+
+    tier_tbl["Share of all frauds"] = (
+        tier_tbl["Frauds"] / tier_tbl["Frauds"].sum()
+    )
+
+    tier_rate = tier_tbl["FraudRate"].to_dict()
+
+    st.markdown("#### 4a. What does each risk tier really contain?")
+
+    st.dataframe(
+        tier_tbl.rename(columns={"FraudRate": "Actual Fraud Rate"}).style.format({
+            "Claims": "{:,.0f}",
+            "Frauds": "{:,.0f}",
+            "Actual Fraud Rate": "{:.2%}",
+            "Share of all frauds": "{:.1%}"
+        }),
+        use_container_width=True
+    )
+
+    honest_per_100 = (1 - results["hit_rate"]) * 100
+
+    k1, k2 = st.columns(2)
+
+    k1.metric(
+        "Honest customers per 100 claims in the top-5% queue",
+        f"{honest_per_100:.0f}"
+    )
+
+    k2.metric(
+        "Frauds that sit OUTSIDE the top-5% queue",
+        f"{(1 - results['fraud_capture_rate']):.0%}"
+    )
+
+    st.caption(
+        "Read this as a manager: most flagged claims can still be honest, and some fraud "
+        "is always missed. Hence: never deny on the score alone, and keep a small random "
+        "audit on the lower tier."
+    )
+
+    # ---- decision matrix ----
+    st.markdown("#### 4b. Decision matrix: risk tier × customer value")
+
+    matrix = pd.DataFrame({
+        "Risk tier": [
+            "Lower",
+            "Elevated",
+            "High (top-5% queue)"
+        ],
+        "Standard customer": [
+            "Straight-through payment; 2–5% random quality audit",
+            "Adjuster checks documents (normal turnaround)",
+            "Investigator review; pay, hold or decline only on documented evidence"
+        ],
+        "High-value / long-tenure customer": [
+            "Straight-through payment; 2–5% random quality audit",
+            "Senior adjuster, fast-track; relationship manager informed",
+            "Review committee (claims, underwriting, relationship manager, compliance) — no decision on the score alone"
+        ]
+    })
+
+    st.dataframe(
+        matrix,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ---- workflow ----
+    st.markdown("#### 4c. Human-in-the-loop workflow")
+
+    workflow = pd.DataFrame({
+        "Stage": [
+            "1. Automated scoring",
+            "2. Triage",
+            "3. Evidence review",
+            "4. Review committee",
+            "5. Customer communication",
+            "6. Feedback loop"
+        ],
+        "Who": [
+            "Model",
+            "Claims system",
+            "Adjuster / investigator",
+            "Claims head, underwriting, relationship manager, compliance",
+            "Claims team",
+            "Analytics team"
+        ],
+        "What happens": [
+            "Risk score, percentile and top drivers are produced for every claim",
+            "Claim is routed by risk tier and customer value (matrix above)",
+            "Documents, photos and third-party facts are checked; findings are written down",
+            "High-risk + high-value or disputed cases are decided case by case, with written reasons",
+            "Any hold or decline is explained neutrally, with an appeal route",
+            "Closed-case outcomes and overrides are logged and used to retrain and re-audit the model"
+        ]
+    })
+
+    st.dataframe(
+        workflow,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.markdown(
+        """
+        **Governance principles**
+
+        - The AI score is **never the sole ground** for denying a claim.
+        - Reviewers see the **top drivers** and may **override with a written reason**.
+        - Customers get a neutral explanation and a **right to appeal**.
+        - Track **override, complaint and churn rates by segment** — this catches bias the model audit cannot see.
+        - Confirmed outcomes flow back into training, which reduces label bias over time.
+        """
+    )
+
+    # ---- simulator ----
+    st.markdown("#### 4d. Case review simulator (decision support for the committee)")
+
+    st.caption(
+        "Fraud likelihood comes from the tier table above (actual test data). "
+        "Premium, churn, cost and detection inputs are manager assumptions — "
+        "replace the illustrative defaults with real figures."
+    )
+
+    med_claim = float(round(df_clean["ClaimAmount"].median(), -2))
+
+    s1, s2, s3 = st.columns(3)
+
+    with s1:
+        case_tier = st.selectbox(
+            "Model risk tier",
+            list(tier_rate.keys())
+        )
+
+        case_claim = st.number_input(
+            "Claim amount",
+            min_value=0.0,
+            value=max(med_claim, 1000.0),
+            step=1000.0,
+            key="case_claim"
+        )
+
+    with s2:
+        case_premium = st.number_input(
+            "Annual premium paid by the customer",
+            min_value=0.0,
+            value=max(round(med_claim * 0.2, -2), 500.0),
+            step=500.0,
+            key="case_premium"
+        )
+
+        case_years = st.number_input(
+            "Expected remaining relationship (years)",
+            min_value=0.0,
+            value=5.0,
+            step=1.0,
+            key="case_years"
+        )
+
+    with s3:
+        case_churn = st.slider(
+            "Chance an honest customer leaves after an investigation (%)",
+            0, 100, 30,
+            key="case_churn"
+        )
+
+        case_cost = st.number_input(
+            "Cost of one investigation",
+            min_value=0.0,
+            value=max(round(med_claim * 0.05, -2), 100.0),
+            step=100.0,
+            key="case_cost"
+        )
+
+    case_detect = st.slider(
+        "Chance an investigation catches real fraud (%)",
+        0, 100, 80,
+        key="case_detect"
+    )
+
+    p_fraud = float(tier_rate[case_tier])
+
+    loss_avoided = p_fraud * case_claim * case_detect / 100
+    relationship_cost = (
+        (1 - p_fraud) * (case_churn / 100) * case_premium * case_years
+    )
+    net_value = loss_avoided - case_cost - relationship_cost
+    lifetime_premium = case_premium * case_years
+
+    r1, r2, r3, r4 = st.columns(4)
+
+    r1.metric("Fraud likelihood (tier)", f"{p_fraud:.2%}")
+    r2.metric("Fraud loss avoided", f"{loss_avoided:,.0f}")
+    r3.metric(
+        "Investigation + relationship cost",
+        f"{case_cost + relationship_cost:,.0f}"
+    )
+    r4.metric("Net value of investigating", f"{net_value:,.0f}")
+
+    if net_value > 0 and lifetime_premium >= case_claim:
+        st.warning(
+            "⚖️ **Send to review committee.** Investigation pays off, but this customer's "
+            "lifetime premium is at least as large as the claim. Handle it as a relationship "
+            "case: senior reviewer, fast turnaround, neutral communication, written decision."
+        )
+    elif net_value > 0:
+        st.error(
+            "🔍 **Route to investigator.** Expected fraud loss avoided is higher than the "
+            "cost of investigating and the risk to the relationship."
+        )
+    else:
+        st.success(
+            "✅ **Light-touch check, then pay.** Investigating costs more than it is expected "
+            "to save. Pay with a post-payment sample audit unless the documents show a red flag."
+        )
+
+    st.caption(
+        "Decision support only: the committee has the final say. Rule used: net value > 0 → "
+        "investigate; and if lifetime premium ≥ claim amount → committee."
+    )
+
+    # ---- KPIs ----
+    st.markdown("#### 4e. Balanced scorecard for management")
+
+    kpis = pd.DataFrame({
+        "KPI": [
+            "Fraud capture rate (top 5%)",
+            "Honest customers per 100 reviewed claims",
+            "Override rate by segment",
+            "Complaints and churn after review",
+            "Review turnaround time",
+            "Flag-rate ratio and FPR gap"
+        ],
+        "Protects against": [
+            "Fraud loss",
+            "Customer friction",
+            "Hidden bias (model and reviewers)",
+            "Loss of valuable customers",
+            "Delay for honest customers",
+            "Unequal treatment of segments"
+        ],
+        "Source": [
+            "Model results (page 7)",
+            "Model results (this page)",
+            "Committee decision log",
+            "CRM / claims operations",
+            "Claims operations",
+            "Fairness audit (Steps 2–3)"
+        ]
+    })
+
+    st.dataframe(
+        kpis,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # --------------------------------------------------------
     st.subheader("Limitations")
 
     st.warning(
         "1) The Fraud label comes from past investigations, so historical bias can remain.  \n"
         "2) We audit proxy segments, not gender/age/religion directly — the dataset does not contain them.  \n"
         "3) Fairness and accuracy trade off; the business must decide the acceptable balance.  \n"
-        "4) The audit must be repeated whenever the model is retrained."
+        "4) The audit must be repeated whenever the model is retrained.  \n"
+        "5) Human reviewers have biases too — their decisions must be logged and audited as well."
     )
 
 
