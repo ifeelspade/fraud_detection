@@ -27,7 +27,11 @@ st.title("🔎 Fraud Detection — End-to-End Machine Learning")
 st.caption(
     "Interactive presentation dashboard: Raw Data → Cleaning → "
     "Feature Engineering → Model Selection → Training → Evaluation → Fraud Detection"
-    "Utkarsh Kulshrestha, Vinay Supekar, Siddhant Chiring, Shashwat Aayush"
+    
+)
+st.caption(
+    
+    "Utkarsh Kulshrestha/nVinay Supekar/nSiddhant Chiring/nShashwat Aayush"
 )
 
 # ============================================================
