@@ -23,15 +23,64 @@ st.set_page_config(
     layout="wide"
 )
 
+# ============================================================
+# RUNNING HEADER — TEAM MEMBERS
+# ============================================================
+
+st.markdown(
+    """
+    <style>
+    .marquee {
+        width: 100%;
+        overflow: hidden;
+        white-space: nowrap;
+        box-sizing: border-box;
+        padding: 8px 0;
+        margin-bottom: 10px;
+        font-size: 18px;
+        font-weight: bold;
+    }
+
+    .marquee span {
+        display: inline-block;
+        padding-left: 100%;
+        animation: marquee 15s linear infinite;
+    }
+
+    @keyframes marquee {
+        0% {
+            transform: translateX(0);
+        }
+        100% {
+            transform: translateX(-100%);
+        }
+    }
+    </style>
+
+    <div class="marquee">
+        <span>
+            🔎 INSURANCE FRAUD DETECTION
+            &nbsp;&nbsp; | &nbsp;&nbsp;
+            UTKARSH KULSHRESTHA
+            &nbsp;&nbsp; | &nbsp;&nbsp;
+            VINAY SUPEKAR
+            &nbsp;&nbsp; | &nbsp;&nbsp;
+            SIDDHANT CHIRING
+            &nbsp;&nbsp; | &nbsp;&nbsp;
+            SHASHWAT AAYUSH
+            &nbsp;&nbsp; | &nbsp;&nbsp;
+            K J SOMAIYA INSTITUTE OF MANAGEMENT
+        </span>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
 st.title("🔎 Fraud Detection — End-to-End Machine Learning")
 st.caption(
     "Interactive presentation dashboard: Raw Data → Cleaning → "
     "Feature Engineering → Model Selection → Training → Evaluation → Fraud Detection"
     
-)
-st.caption(
-    
-    "Utkarsh Kulshrestha\nVinay Supekar\nSiddhant Chiring\nShashwat Aayush"
 )
 
 # ============================================================
